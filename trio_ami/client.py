@@ -119,7 +119,7 @@ class AMIClient(object):
                 with trio.open_cancel_scope(shield=True):
                     await self._socket.aclose()
                 self._socket = None
-                raise
+            raise
 
         self.finished = trio.Event()
         await self._nursery.start(self.listen)
