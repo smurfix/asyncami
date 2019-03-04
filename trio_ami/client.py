@@ -1,7 +1,9 @@
 import re
+import trio
 import socket
-import threading
+from outcome import capture
 from functools import partial
+from async_generator import asynccontextmanager
 
 from .action import Action, LoginAction, LogoffAction, SimpleAction
 from .event import Event, EventListener
@@ -60,6 +62,16 @@ class AMIClientListener(object):
         raise NotImplementedError()
 
 
+@asynccontextmanager
+async def open_ami_client(*args, **kwargs):
+    async with trio.open_nursery() as n:
+        client = AMIClient(*args, _nursery=n, **kwargs)
+        try:
+            # await client.connect()
+            yield client
+        finally:
+            await client.aclose()
+
 class AMIClient(object):
     asterisk_start_regex = re.compile('^Asterisk *Call *Manager/(?P<version>([0-9]+\.)*[0-9]+)', re.IGNORECASE)
     asterisk_line_regex = re.compile(b'\r\n', re.IGNORECASE | re.MULTILINE)
@@ -67,7 +79,7 @@ class AMIClient(object):
 
     def __init__(self, address='127.0.0.1', port=5038,
                  encoding='utf-8', timeout=3, buffer_size=2 ** 10,
-                 **kwargs):
+                 _nursery=None, **kwargs):
         self._action_counter = 0
         self._futures = {}
         self._listeners = []
@@ -76,128 +88,139 @@ class AMIClient(object):
         self._buffer_size = buffer_size
         self._port = port
         self._socket = None
-        self._thread = None
         self.finished = None
         self._ami_version = None
         self._timeout = timeout
+        self._nursery = _nursery
         self.encoding = encoding
         if len(kwargs) > 0:
             self.add_listener(**kwargs)
+
+    async def __aenter__(self):
+        await self.connect()
+        return self
+
+    async def __aexit__(self, *tb):
+        await self.aclose()
 
     def next_action_id(self):
         id = self._action_counter
         self._action_counter += 1
         return str(id)
 
-    def connect(self):
-        self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._socket.connect((self._address, self._port))
-        self.finished = threading.Event()
-        self._thread = threading.Thread(target=self.listen)
-        self._thread.daemon = True
-        self._thread.start()
-
-    def _fire_on_connect(self, **kwargs):
-        for listener in self._listeners:
-            listener.on_connect(source=self, **kwargs)
-
-    def _fire_on_disconnect(self, **kwargs):
-        for listener in self._listeners:
-            listener.on_disconnect(source=self, **kwargs)
-
-    def _fire_on_response(self, **kwargs):
-        for listener in self._listeners:
-            listener.on_response(source=self, **kwargs)
-
-    def _fire_on_action(self, **kwargs):
-        for listener in self._listeners:
-            listener.on_action(source=self, **kwargs)
-
-    def _fire_on_event(self, **kwargs):
-        for listener in self._listeners:
-            listener.on_event(source=self, **kwargs)
-
-    def _fire_on_unknown(self, **kwargs):
-        for listener in self._listeners:
-            listener.on_unknown(source=self, **kwargs)
-
-    def disconnect(self):
-        self.finished.set()
+    async def connect(self):
+        if self._socket is not None:
+            raise RuntimeError("alrady connected")
         try:
-            self._socket.close()
-            self._thread.join()
-        except:
+            with trio.fail_after(self._timeout):
+                self._socket = await trio.open_tcp_stream(self._address, self._port)
+        except BaseException:
+            if self._socket is not None:
+                with trio.open_cancel_scope(shield=True):
+                    await self._socket.aclose()
+                self._socket = None
+                raise
+
+        self.finished = trio.Event()
+        await self._nursery.start(self.listen)
+
+    async def _fire_on_connect(self, **kwargs):
+        for listener in self._listeners:
+            await listener.on_connect(source=self, **kwargs)
+
+    async def _fire_on_disconnect(self, **kwargs):
+        for listener in self._listeners:
+            await listener.on_disconnect(source=self, **kwargs)
+
+    async def _fire_on_response(self, **kwargs):
+        for listener in self._listeners:
+            await listener.on_response(source=self, **kwargs)
+
+    async def _fire_on_action(self, **kwargs):
+        for listener in self._listeners:
+            await listener.on_action(source=self, **kwargs)
+
+    async def _fire_on_event(self, **kwargs):
+        for listener in self._listeners:
+            await listener.on_event(source=self, **kwargs)
+
+    async def _fire_on_unknown(self, **kwargs):
+        for listener in self._listeners:
+            await listener.on_unknown(source=self, **kwargs)
+
+    async def aclose(self):
+        if self.finished is not None:
+            self.finished.set()
+        try:
+            await self._socket.aclose()
+        except Exception:
             pass
 
-    def login(self, username, secret, callback=None):
+    async def login(self, username, secret):
         if self.finished is None or self.finished.is_set():
-            self.connect()
-        return self.send_action(LoginAction(username, secret), callback)
+            await self.connect()
+        return await self.send_action(LoginAction(username, secret))
 
-    def logoff(self, callback=None):
+    async def logoff(self):
         if self.finished is None or self.finished.is_set():
             return
-        return self.send_action(LogoffAction(), callback)
+        return await self.send_action(LogoffAction())
 
-    def send_action(self, action, callback=None):
+    async def send_action(self, action):
         if 'ActionID' not in action.keys:
             action_id = self.next_action_id()
             action.keys['ActionID'] = action_id
         else:
             action_id = action.keys['ActionID']
+        evt = trio.Event()
         future = FutureResponse(callback, self._timeout)
-        self._futures[action_id] = future
+        self._futures[action_id] = evt
         self._fire_on_action(action=action)
-        self.send(action)
-        return future
+        await self.send(action)
+        await evt.wait()
 
-    def send(self, pack):
-        self._socket.send(bytearray(unicode(pack) + '\r\n', self.encoding))
+        return result.unwrap()
+
+    async def send(self, pack):
+        await self._socket.send_all(bytearray(str(pack) + '\r\n', self.encoding))
 
     def _decode_pack(self, pack):
         return pack.decode(self.encoding)
 
-    def _next_pack(self):
+    async def _next_pack(self):
         data = b''
+        regex = self.asterisk_line_regex
         while not self.finished.is_set():
-            recv = self._socket.recv(self._buffer_size)
+            recv = await self._socket.receive_some(self._buffer_size)
             if recv == b'':
                 self.finished.set()
                 continue
             data += recv
-            if self.asterisk_line_regex.search(data):
+            while regex.search(data):
                 (pack, data) = self.asterisk_line_regex.split(data, 1)
                 yield self._decode_pack(pack)
-                break
-        while not self.finished.is_set():
-            while self.asterisk_pack_regex.search(data):
-                (pack, data) = self.asterisk_pack_regex.split(data, 1)
-                yield self._decode_pack(pack)
-            recv = self._socket.recv(self._buffer_size)
-            if recv == b'':
-                self.finished.set()
-                continue
-            data += recv
+                regex = self.asterisk_pack_regex
         self._socket.close()
 
-    def listen(self):
+    async def listen(self, task_status=trio.TASK_STATUS_IGNORED):
         pack_generator = self._next_pack()
-        asterisk_start = next(pack_generator)
+        asterisk_start = await pack_generator.__anext__()
         match = AMIClient.asterisk_start_regex.match(asterisk_start)
         if not match:
             raise Exception()
         self._ami_version = match.group('version')
-        self._fire_on_connect()
+        await self._fire_on_connect()
+        task_status.started()
         try:
             while not self.finished.is_set():
-                pack = next(pack_generator)
-                self.fire_recv_pack(pack)
+                pack = pack_generator.__anext__()
+                await self.fire_recv_pack(pack)
             self._fire_on_disconnect(error=None)
         except Exception as ex:
-            self._fire_on_disconnect(error=ex)
+            await self._fire_on_disconnect(error=ex)
 
-    def fire_recv_reponse(self, response):
-        self._fire_on_response(response=response)
+    async def fire_recv_reponse(self, response):
+        await self._fire_on_response(response=response)
         if response.status.lower() == 'goodbye':
             self.finished.set()
         if 'ActionID' not in response.keys:
@@ -205,24 +228,25 @@ class AMIClient(object):
         action_id = response.keys['ActionID']
         if action_id not in self._futures:
             return
-        future = self._futures.pop(action_id)
-        future.response = response
+        event = self._futures[action_id]
+        self._futures[action_id] = response
+        event.set()
 
-    def fire_recv_event(self, event):
+    async def fire_recv_event(self, event):
         self._fire_on_event(event=event)
         for listener in self._event_listeners:
-            listener(event=event, source=self)
+            await listener(event=event, source=self)
 
-    def fire_recv_pack(self, pack):
+    async def fire_recv_pack(self, pack):
         if Response.match(pack):
             response = Response.read(pack)
-            self.fire_recv_reponse(response)
+            await self.fire_recv_reponse(response)
             return
         if Event.match(pack):
             event = Event.read(pack)
-            self.fire_recv_event(event)
+            await self.fire_recv_event(event)
             return
-        self._fire_on_unknown(pack=pack)
+        await self._fire_on_unknown(pack=pack)
 
     def add_listener(self, listener=None, **kwargs):
         if not listener:
@@ -260,10 +284,12 @@ class AMIClientAdapter(object):
     def __getattr__(self, item):
         return partial(self._action, item)
 
+async def _ignore(*args):
+    pass
 
-class AutoReconnect(threading.Thread):
+class AutoReconnect:
     def __init__(self, ami_client, delay=0.5,
-                 on_disconnect=lambda *args: None, on_reconnect=lambda *args: None):
+                 on_disconnect=_ignore, on_reconnect=_ignore):
         super(AutoReconnect, self).__init__()
         self.on_reconnect = on_reconnect
         self.on_disconnect = on_disconnect
@@ -273,7 +299,6 @@ class AutoReconnect(threading.Thread):
         self._login_args = None
         self._login = None
         self._logoff = None
-        self._prepare_client()
 
     def _prepare_client(self):
         self._login = self._ami_client.login
@@ -285,53 +310,51 @@ class AutoReconnect(threading.Thread):
         self._ami_client.login = self._login
         self._ami_client.logoff = self._logoff
 
-    def _login_wrapper(self, *args, **kwargs):
-        callback = kwargs.pop('callback', None) or (lambda *a, **k: None)
-
-        def on_login(response, *a, **k):
-            if not response.is_error():
-                if self._login_args is None:
-                    self.finished = threading.Event()
-                    self.start()
-                self._login_args = (args, kwargs)
-            callback(response, *a, **k)
+    async def _login_wrapper(self, *args, **kwargs):
+        response = await self._login(*args, **kwargs)
+        if not response.is_error():
+            if self._login_args is None:
+                self.finished = trio.Event()
+                await self._ami_client._nursery.start(self.run)
+            self._login_args = (args, kwargs)
 
         kwargs['callback'] = on_login
-        return self._login(*args, **kwargs)
 
-    def _logoff_wrapper(self, *args, **kwargs):
+    async def _logoff_wrapper(self, *args, **kwargs):
         self.finished.set()
         self._rollback_client()
-        return self._logoff(*args, **kwargs)
+        return await self._logoff(*args, **kwargs)
 
-    def ping(self):
+    async def ping(self):
         try:
-            f = self._ami_client.send_action(Action('Ping'))
-            response = f.response
+            response = await self._ami_client.send_action(Action('Ping'))
             if response is not None and not response.is_error():
                 return True
-            self.on_disconnect(self._ami_client, response)
+            await self.on_disconnect(self._ami_client, response)
         except Exception as ex:
-            self.on_disconnect(self._ami_client, ex)
+            await self.on_disconnect(self._ami_client, ex)
         return False
 
-    def try_reconnect(self):
+    async def try_reconnect(self):
         try:
             f = self._login(*self._login_args[0], **self._login_args[1])
             response = f.response
             if response is not None and not response.is_error():
-                self.on_reconnect(self._ami_client, response)
+                await self.on_reconnect(self._ami_client, response)
                 return True
-        except:
+        except Exception:
             pass
         return False
 
-    def run(self):
-        self.finished.wait(self.delay)
-        while not self.finished.is_set():
-            if not self.ping():
-                self.try_reconnect()
-            self.finished.wait(self.delay)
+    async def run(self, task_status=trio.TASK_STATUS_IGNORED):
+        self._prepare_client()
+        task_status.started()
+        try:
+            while not self.finished.is_set():
+                with trio.move_on_after(self.delay):
+                    await self.finished.wait()
+                if not await self.ping():
+                    await self.try_reconnect()
+        finally:
+            self._rollback_client()
 
-    def __del__(self):
-        self._rollback_client()
