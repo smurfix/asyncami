@@ -1,24 +1,26 @@
-#!/usr/bin/python
+#!/usr/bin/python3
 import os
 import time
 from settings import login, connection
 
-from asterisk.ami import AMIClient
+import trio
+import math
+from trio_ami import open_ami_client
 
 
-def event_notification(source, event):
-    os.system('notify-send "%s" "%s"' % (event.name, str(event)))
+async def event_notification(source, event):
+    print(source,event)
 
 
-client = AMIClient(**connection)
-future = client.login(**login)
-if future.response.is_error():
-    raise Exception(str(future.response))
+async def main():
+    async with open_ami_client(**connection) as client:
+        await client.login(**login)
+        client.add_event_listener(event_notification)
+        print("Connected.")
+        trio.sleep(math.inf)
 
-client.add_event_listener(event_notification)
-
-try:
-    while True:
-        time.sleep(10)
-except (KeyboardInterrupt, SystemExit):
-    client.logoff()
+if __name__ == "__main__":
+    try:
+        trio.run(main)
+    except KeyboardInterrupt:
+        pass

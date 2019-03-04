@@ -1,3 +1,5 @@
+#!/usr/bin/python3
+
 """
 requirements:
     pip install paho-mqtt
