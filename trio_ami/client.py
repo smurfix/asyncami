@@ -7,7 +7,7 @@ from async_generator import asynccontextmanager
 
 from .action import Action, LoginAction, LogoffAction, SimpleAction
 from .event import Event, EventListener
-from .response import Response, FutureResponse
+from .response import Response, Future
 
 try:
     unicode = unicode
@@ -104,8 +104,8 @@ class AMIClient(object):
         await self.aclose()
 
     def next_action_id(self):
-        id = self._action_counter
         self._action_counter += 1
+        id = self._action_counter
         return str(id)
 
     async def connect(self):
@@ -172,14 +172,12 @@ class AMIClient(object):
             action.keys['ActionID'] = action_id
         else:
             action_id = action.keys['ActionID']
-        evt = trio.Event()
-        future = FutureResponse(callback, self._timeout)
-        self._futures[action_id] = evt
-        self._fire_on_action(action=action)
-        await self.send(action)
-        await evt.wait()
 
-        return result.unwrap()
+        future = Future()
+        self._futures[action_id] = future
+        await self._fire_on_action(action=action)
+        await self.send(action)
+        return await future
 
     async def send(self, pack):
         await self._socket.send_all(bytearray(str(pack) + '\r\n', self.encoding))
@@ -191,13 +189,16 @@ class AMIClient(object):
         data = b''
         regex = self.asterisk_line_regex
         while not self.finished.is_set():
-            recv = await self._socket.receive_some(self._buffer_size)
-            if recv == b'':
+            try:
+                recv = await self._socket.receive_some(self._buffer_size)
+            except trio.ClosedResourceError:
+                b = b''
+            if not recv:
                 self.finished.set()
-                continue
+                break
             data += recv
             while regex.search(data):
-                (pack, data) = self.asterisk_line_regex.split(data, 1)
+                (pack, data) = regex.split(data, 1)
                 yield self._decode_pack(pack)
                 regex = self.asterisk_pack_regex
         self._socket.close()
@@ -218,6 +219,7 @@ class AMIClient(object):
             await self._fire_on_disconnect(error=None)
         except Exception as ex:
             await self._fire_on_disconnect(error=ex)
+            raise
 
     async def fire_recv_reponse(self, response):
         await self._fire_on_response(response=response)

@@ -1,6 +1,6 @@
 import re
-import threading
-
+import trio
+import outcome
 
 class Response(object):
     match_regex = re.compile('^Response: .*', re.IGNORECASE)
@@ -51,31 +51,64 @@ class Response(object):
     def is_error(self):
         return self.status.lower() == 'error'
 
+class Future:
+    """A waitable value useful for inter-task synchronization.
 
-class FutureResponse(object):
-    def __init__(self, callback=None, timeout=None):
-        self._timeout = timeout
-        self._response = None
-        self._lock = threading.Condition()
-        self._callback = callback
+    An event object manages an internal value, which is initially
+    unset, and a task can wait for it to become True.
 
-    def set_response(self, response):
-        try:
-            if self._callback is not None:
-                self._callback(response)
-        except Exception as ex:
-            print(ex)
-        self._lock.acquire()
-        self._response = response
-        self._lock.notifyAll()
-        self._lock.release()
+    Args:
+      ``scope``:  A cancelation scope that will be cancelled if/when
+                  this ValueEvent is. Used for clean cancel propagation.
 
-    def get_response(self):
-        if self._response is not None:
-            return self._response
-        self._lock.acquire()
-        self._lock.wait(self._timeout)
-        self._lock.release()
-        return self._response
+    Note that the value can only be read once.
+    """
 
-    response = property(get_response, set_response)
+    def __init__(self, scope=None):
+        self.value = None
+        self.event = trio.Event()
+        self.scope = scope
+
+    async def set(self, value=None):
+        """Set the result to return this value, and wake any waiting task.
+        """
+        if self.value is not None:
+            raise RuntimeError("already set")
+        self.value = outcome.Value(value)
+        self.event.set()
+
+    async def set_error(self, exc):
+        """Set the result to raise this exceptio, and wake any waiting task.
+        """
+        if self.value is not None:
+            raise RuntimeError("already set")
+        self.value = outcome.Error(exc)
+        self.event.set()
+
+    def is_set(self):
+        """Check whether the event has occurred.
+        """
+        return self.value is not None
+
+    async def cancel(self):
+        """Send a cancelation to the recipient.
+
+        TODO: Trio can't do that cleanly.
+        """
+        if self.scope is not None:
+            await self.scope.cancel()
+        return await self.set_error(CancelledError())
+
+    async def get(self):
+        """Block until the value is set.
+
+        If it's already set, then this method returns immediately.
+
+        The value can only be read once.
+        """
+        await self.event.wait()
+        return self.value.unwrap()
+
+    def __await__(self):
+        return self.get().__await__()
+
