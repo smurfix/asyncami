@@ -213,9 +213,9 @@ class AMIClient(object):
         task_status.started()
         try:
             while not self.finished.is_set():
-                pack = pack_generator.__anext__()
+                pack = await pack_generator.__anext__()
                 await self.fire_recv_pack(pack)
-            self._fire_on_disconnect(error=None)
+            await self._fire_on_disconnect(error=None)
         except Exception as ex:
             await self._fire_on_disconnect(error=ex)
 
@@ -230,10 +230,10 @@ class AMIClient(object):
             return
         event = self._futures[action_id]
         self._futures[action_id] = response
-        event.set()
+        await event.set()
 
     async def fire_recv_event(self, event):
-        self._fire_on_event(event=event)
+        await self._fire_on_event(event=event)
         for listener in self._event_listeners:
             await listener(event=event, source=self)
 

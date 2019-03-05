@@ -17,7 +17,7 @@ async def main():
         await client.login(**login)
         client.add_event_listener(event_notification)
         print("Connected.")
-        trio.sleep(math.inf)
+        await trio.sleep(math.inf)
 
 if __name__ == "__main__":
     try:
