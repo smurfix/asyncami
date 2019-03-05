@@ -8,3 +8,4 @@ coverage.xml
 \.*
 !.gitignore
 !.travis.yml
+/.pybuild/

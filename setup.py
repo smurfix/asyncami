@@ -3,24 +3,25 @@ import os
 
 from setuptools import setup, find_packages
 
-from asterisk import __version__
-
-
 def read(file_name):
     with open(os.path.join(os.path.dirname(__file__), file_name)) as f:
         return f.read()
 
-
 requirements = read('requirements.txt').splitlines()
-str_version = '.'.join(map(str, __version__))
 
 setup(
     name='asterisk-ami',
-    version=str_version,
+    use_scm_version={
+        "version_scheme": "guess-next-dev",
+        "local_scheme": "dirty-tag"
+    },
+    setup_requires=[
+        "setuptools_scm",
+        "pytest-runner"
+    ],
     description='Python AMI Client',
     long_description=read('README.rst'),
     url='https://github.com/ettoreleandrotognoli/python-ami/',
-    download_url='https://github.com/ettoreleandrotognoli/python-ami/tree/%s/' % str_version,
     license='BSD',
     author=u'Éttore Leandro Tognoli',
     author_email='ettore.leandro.tognoli@gmail.com',

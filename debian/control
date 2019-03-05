@@ -1,0 +1,33 @@
+Source: asterisk-ami
+Maintainer: Matthias Urlichs <matthias@urlichs.de>
+Section: python
+Priority: optional
+Build-Depends: dh-python, python3-setuptools, python3-all, debhelper (>= 9)
+Standards-Version: 3.9.6
+Homepage: https://github.com/ettoreleandrotognoli/python-ami/
+
+Package: python3-asterisk-ami
+Architecture: all
+Depends: ${misc:Depends}, ${python3:Depends}
+Description: Python AMI Client
+ =================
+ Python AMI Client
+ =================
+ .
+ .. image:: https://travis-ci.org/ettoreleandrotognoli/python-ami.svg?branch=master
+     :target: https://travis-ci.org/ettoreleandrotognoli/python-ami
+ .
+ .. image:: https://codecov.io/gh/ettoreleandrotognoli/python-ami/branch/master/graph/badge.svg
+     :target: https://codecov.io/gh/ettoreleandrotognoli/python-ami
+ .
+ .. image:: https://badge.fury.io/py/asterisk-ami.svg
+     :target: https://badge.fury.io/py/asterisk-ami
+ .
+ .. image:: https://img.shields.io/pypi/dm/asterisk-ami.svg
+     :target: https://pypi.python.org/pypi/asterisk-ami#downloads
+ .
+ A simple Python AMI client
+ http://programandonoaquario.blogspot.com.br
+ .
+ See the `code of conduct <CODE_OF_CONDUCT.md>`_.
+
