@@ -3,9 +3,9 @@ import os
 import time
 from settings import login, connection
 
-import trio
+import anyio
 import math
-from trio_ami import open_ami_client
+from asyncami import open_ami_client
 
 
 async def event_notification(source, event):
@@ -17,10 +17,10 @@ async def main():
         await client.login(**login)
         client.add_event_listener(event_notification)
         print("Connected.")
-        await trio.sleep(math.inf)
+        await anyio
 
 if __name__ == "__main__":
     try:
-        trio.run(main)
+        anyio.run(main)
     except KeyboardInterrupt:
         pass
