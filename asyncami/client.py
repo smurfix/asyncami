@@ -1,5 +1,5 @@
 import re
-import trio
+import anyio
 import socket
 from outcome import capture
 from functools import partial
@@ -64,8 +64,8 @@ class AMIClientListener(object):
 
 @asynccontextmanager
 async def open_ami_client(*args, **kwargs):
-    async with trio.open_nursery() as n:
-        client = AMIClient(*args, _nursery=n, **kwargs)
+    async with anyio.create_task_group() as tg:
+        client = AMIClient(*args, _taskgroup=tg, **kwargs)
         try:
             # await client.connect()
             yield client
@@ -112,16 +112,16 @@ class AMIClient(object):
         if self._socket is not None:
             raise RuntimeError("alrady connected")
         try:
-            with trio.fail_after(self._timeout):
-                self._socket = await trio.open_tcp_stream(self._address, self._port)
+            async with anyio.fail_after(self._timeout):
+                self._socket = await anyio.connect_tcp(self._address, self._port)
         except BaseException:
             if self._socket is not None:
-                with trio.open_cancel_scope(shield=True):
-                    await self._socket.aclose()
+                with anyio.open_cancel_scope(shield=True):
+                    await self._socket.close()
                 self._socket = None
             raise
 
-        self.finished = trio.Event()
+        self.finished = anyio.create_event()
         await self._nursery.start(self.listen)
 
     async def _fire_on_connect(self, **kwargs):
@@ -150,7 +150,7 @@ class AMIClient(object):
 
     async def aclose(self):
         if self.finished is not None:
-            self.finished.set()
+            await self.finished.set()
         try:
             await self._socket.aclose()
         except Exception:
@@ -191,10 +191,10 @@ class AMIClient(object):
         while not self.finished.is_set():
             try:
                 recv = await self._socket.receive_some(self._buffer_size)
-            except trio.ClosedResourceError:
+            except anyio.exceptions.ClosedResourceError:
                 b = b''
             if not recv:
-                self.finished.set()
+                await self.finished.set()
                 break
             data += recv
             while regex.search(data):
@@ -203,7 +203,7 @@ class AMIClient(object):
                 regex = self.asterisk_pack_regex
         self._socket.close()
 
-    async def listen(self, task_status=trio.TASK_STATUS_IGNORED):
+    async def listen(self, running=None):
         pack_generator = self._next_pack()
         asterisk_start = await pack_generator.__anext__()
         match = AMIClient.asterisk_start_regex.match(asterisk_start)
@@ -211,7 +211,8 @@ class AMIClient(object):
             raise Exception()
         self._ami_version = match.group('version')
         await self._fire_on_connect()
-        task_status.started()
+        if running is not None:
+            await running.set()
         try:
             while not self.finished.is_set():
                 pack = await pack_generator.__anext__()
@@ -224,7 +225,7 @@ class AMIClient(object):
     async def fire_recv_reponse(self, response):
         await self._fire_on_response(response=response)
         if response.status.lower() == 'goodbye':
-            self.finished.set()
+            await self.finished.set()
         if 'ActionID' not in response.keys:
             return
         action_id = response.keys['ActionID']
@@ -316,14 +317,14 @@ class AutoReconnect:
         response = await self._login(*args, **kwargs)
         if not response.is_error():
             if self._login_args is None:
-                self.finished = trio.Event()
+                self.finished = anyio.create_event()
                 await self._ami_client._nursery.start(self.run)
             self._login_args = (args, kwargs)
 
         kwargs['callback'] = on_login
 
     async def _logoff_wrapper(self, *args, **kwargs):
-        self.finished.set()
+        await self.finished.set()
         self._rollback_client()
         return await self._logoff(*args, **kwargs)
 
@@ -348,12 +349,13 @@ class AutoReconnect:
             pass
         return False
 
-    async def run(self, task_status=trio.TASK_STATUS_IGNORED):
+    async def run(self, running=None):
         self._prepare_client()
-        task_status.started()
+        if running is not None:
+            await running.set()
         try:
             while not self.finished.is_set():
-                with trio.move_on_after(self.delay):
+                with anyio.move_on_after(self.delay):
                     await self.finished.wait()
                 if not await self.ping():
                     await self.try_reconnect()

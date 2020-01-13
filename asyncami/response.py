@@ -1,5 +1,5 @@
 import re
-import trio
+import anyio
 import outcome
 
 class Response(object):
@@ -66,7 +66,7 @@ class Future:
 
     def __init__(self, scope=None):
         self.value = None
-        self.event = trio.Event()
+        self.event = anyio.create_event()
         self.scope = scope
 
     async def set(self, value=None):
@@ -75,7 +75,7 @@ class Future:
         if self.value is not None:
             raise RuntimeError("already set")
         self.value = outcome.Value(value)
-        self.event.set()
+        await self.event.set()
 
     async def set_error(self, exc):
         """Set the result to raise this exceptio, and wake any waiting task.
@@ -83,7 +83,7 @@ class Future:
         if self.value is not None:
             raise RuntimeError("already set")
         self.value = outcome.Error(exc)
-        self.event.set()
+        await self.event.set()
 
     def is_set(self):
         """Check whether the event has occurred.
@@ -93,7 +93,7 @@ class Future:
     async def cancel(self):
         """Send a cancelation to the recipient.
 
-        TODO: Trio can't do that cleanly.
+        TODO: anyio can't do that cleanly.
         """
         if self.scope is not None:
             await self.scope.cancel()
